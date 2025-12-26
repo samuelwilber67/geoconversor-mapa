@@ -1,30 +1,27 @@
 import streamlit as st
 import pandas as pd
 import simplekml
-from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
+from geopy.geocoders import ArcGIS
 import time
 
 # Configuração da interface
-st.set_page_config(page_title="MAPA - Geoprocessamento Pro", layout="wide")
-st.title("📍 Sistema de Geocodificação de Convênios")
+st.set_page_config(page_title="MAPA - Geoprocessamento Alta Performance", layout="wide")
+st.title("📍 Sistema de Geocodificação de Convênios (Versão Ultra)")
 st.markdown("---")
 
-# Função para limpar nomes burocráticos
+# Função para limpar nomes
 def limpar_nome(nome):
     nome = str(nome).upper()
-    for termo in ["MUNICIPIO DE ", "PREFEITURA DE ", "GOVERNO DE ", "PM DE "]:
+    termos = ["MUNICIPIO DE ", "PREFEITURA DE ", "GOVERNO DE ", "PM DE "]
+    for termo in termos:
         nome = nome.replace(termo, "")
     return nome.strip()
 
-# Inicializa o buscador com identificador ÚNICO e timeout alto
-# O timeout de 20s ajuda a evitar o erro de 'Read Timeout'
-geolocator = Nominatim(user_agent="samuel_wilber_mapa_v4_2025", timeout=20)
+# MUDANÇA CRÍTICA: Trocamos Nominatim por ArcGIS
+# O ArcGIS é muito mais rápido e não exige chaves para buscas simples
+geolocator = ArcGIS(timeout=10)
 
-# O RateLimiter agora está configurado corretamente para ser usado como função
-geocode_service = RateLimiter(geolocator.geocode, min_delay_seconds=1.6, max_retries=3)
-
-uploaded_file = st.file_uploader("Suba sua planilha Excel", type=['xlsx', 'xls'])
+uploaded_file = st.file_uploader("Suba sua planilha Excel (Suporta 1000+ linhas)", type=['xlsx', 'xls'])
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
@@ -35,13 +32,16 @@ if uploaded_file:
     col_mun = st.sidebar.selectbox("Coluna Município", cols)
     col_uf = st.sidebar.selectbox("Coluna UF", cols)
 
-    if st.button("🚀 Iniciar Processamento"):
+    if st.button("🚀 Iniciar Processamento Rápido"):
         kml = simplekml.Kml()
         pontos_ok = 0
         erros = []
+        cache = {} # Evita buscar o mesmo município várias vezes
         
         progress_bar = st.progress(0)
         status_msg = st.empty()
+        
+        start_time = time.time()
 
         for i, row in df.iterrows():
             progress_bar.progress((i + 1) / len(df))
@@ -50,44 +50,43 @@ if uploaded_file:
             uf = str(row[col_uf]).strip()
             convenio = str(row[col_conv]).strip()
             
-            # Tentativa 1: Município + UF + Brasil
             query = f"{mun_limpo}, {uf}, Brasil"
-            status_msg.text(f"Buscando {i+1}/{len(df)}: {query}")
+            status_msg.text(f"Processando {i+1}/{len(df)}: {query}")
 
-            try:
-                # IMPORTANTE: Usamos o geocode_service (RateLimiter) e não o geolocator direto
-                location = geocode_service(query)
-                
-                # Tentativa 2 (Fallback): Se falhar, tenta apenas Município + UF
-                if not location:
-                    location = geocode_service(f"{mun_limpo} {uf}")
+            # Lógica de Cache para acelerar ainda mais
+            if query in cache:
+                location = cache[query]
+            else:
+                try:
+                    # ArcGIS é quase instantâneo, não precisa de RateLimiter lento
+                    location = geolocator.geocode(query)
+                    cache[query] = location
+                except Exception as e:
+                    location = None
+                    erros.append({"Linha": i+2, "Convênio": convenio, "Erro": "Falha na conexão"})
 
-                if location:
-                    pnt = kml.newpoint(name=convenio)
-                    pnt.coords = [(location.longitude, location.latitude)]
-                    pnt.description = f"Município: {row[col_mun]}\nUF: {uf}\nConvênio: {convenio}"
-                    pontos_ok += 1
-                else:
-                    erros.append({"Linha": i+2, "Convênio": convenio, "Busca": query, "Motivo": "Não encontrado"})
-            
-            except Exception as e:
-                erros.append({"Linha": i+2, "Convênio": convenio, "Busca": query, "Motivo": str(e)})
-                time.sleep(2) # Pausa extra em caso de erro de rede
+            if location:
+                pnt = kml.newpoint(name=convenio)
+                pnt.coords = [(location.longitude, location.latitude)]
+                pnt.description = f"Município: {row[col_mun]}\nUF: {uf}\nConvênio: {convenio}"
+                pontos_ok += 1
+            else:
+                erros.append({"Linha": i+2, "Convênio": convenio, "Erro": "Município não encontrado"})
 
-        # Resultados
+        end_time = time.time()
+        tempo_total = round(end_time - start_time, 2)
+        
         status_msg.empty()
-        st.success(f"Processamento concluído! {pontos_ok} pontos gerados com sucesso.")
+        st.success(f"Concluído! {pontos_ok} pontos gerados em {tempo_total} segundos.")
 
         if pontos_ok > 0:
-            # Gerar o KML em memória para download
-            kml_output = kml.kml()
             st.download_button(
                 label="💾 BAIXAR ARQUIVO KML",
-                data=kml_output,
+                data=kml.kml(),
                 file_name="pontos_convenios_mapa.kml",
                 mime="application/vnd.google-earth.kml+xml"
             )
 
         if erros:
-            with st.expander("Ver detalhes dos erros"):
+            with st.expander("Ver detalhes de problemas"):
                 st.table(pd.DataFrame(erros))
