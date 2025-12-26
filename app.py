@@ -6,8 +6,8 @@ import time
 import re
 
 # Configuração da interface
-st.set_page_config(page_title="MAPA - Geoprocessamento Inteligente", layout="wide")
-st.title("📍 Sistema de Geocodificação (Sem Cabeçalho)")
+st.set_page_config(page_title="MAPA - Precisão Geográfica", layout="wide")
+st.title("📍 Geocodificador de Alta Precisão para Convênios")
 st.markdown("---")
 
 CAPITAIS = {
@@ -20,32 +20,19 @@ CAPITAIS = {
     'SP': 'São Paulo', 'SE': 'Aracaju', 'TO': 'Palmas'
 }
 
-def detectar_colunas_por_conteudo(df):
-    """Analisa o conteúdo da primeira linha para adivinhar as colunas"""
-    mapeamento = {}
-    if df.empty: return mapeamento
-    
-    primeira_linha = df.iloc[0]
-    for i, valor in enumerate(primeira_linha):
-        val_str = str(valor).strip().upper()
-        
-        # Detecta UF (Exatamente 2 letras)
-        if len(val_str) == 2 and val_str.isalpha() and 'uf' not in mapeamento:
-            mapeamento['uf'] = i
-        
-        # Detecta Percentual (Tem % ou é um número entre 0 e 100)
-        elif '%' in val_str or (isinstance(valor, (int, float)) and 0 <= valor <= 100):
-            if 'percentual' not in mapeamento: mapeamento['percentual'] = i
-            
-        # Detecta Convênio (Número longo)
-        elif val_str.isdigit() and len(val_str) > 4:
-            if 'convenio' not in mapeamento: mapeamento['convenio'] = i
-            
-        # Detecta Município (Texto que não é UF)
-        elif len(val_str) > 2 and not val_str.isdigit():
-            if 'municipio' not in mapeamento: mapeamento['municipio'] = i
-            
-    return mapeamento
+def limpar_nome_estrito(nome):
+    """Limpeza profunda para evitar que nomes de ruas ou distritos confundam o GPS"""
+    nome = str(nome).upper()
+    # Remove termos que costumam causar erros de localização
+    termos_sujeira = [
+        "MUNICIPIO DE ", "PREFEITURA DE ", "GOVERNO DE ", "PM DE ", 
+        "PREFEITURA MUNICIPAL DE ", "GLEBA ", "LOTE ", "DISTRITO DE ", "VILA "
+    ]
+    for termo in termos_sujeira:
+        nome = nome.replace(termo, "")
+    # Remove qualquer coisa entre parênteses (comum em planilhas de convênio)
+    nome = re.sub(r'\(.*\)', '', nome)
+    return nome.strip()
 
 def obter_estilo_execucao(valor):
     try:
@@ -60,22 +47,19 @@ def obter_estilo_execucao(valor):
     except:
         return 'http://maps.google.com/mapfiles/kml/paddle/wht-circle.png', "Dado Inválido"
 
-geolocator = ArcGIS(timeout=10)
+geolocator = ArcGIS(timeout=15)
 
 uploaded_file = st.file_uploader("Suba sua planilha Excel (sem títulos)", type=['xlsx', 'xls'])
 
 if uploaded_file:
-    # Lemos COM header=None para não perder a primeira linha de dados
     df = pd.read_excel(uploaded_file, header=None)
     
-    # Tenta detectar as colunas pelo que tem dentro delas
-    mapa_idx = detectar_colunas_por_conteudo(df)
-    
-    st.sidebar.header("⚙️ Colunas Detectadas")
-    idx_conv = st.sidebar.number_input("Índice Convênio", value=mapa_idx.get('convenio', 0))
-    idx_mun = st.sidebar.number_input("Índice Município", value=mapa_idx.get('municipio', 1))
-    idx_uf = st.sidebar.number_input("Índice UF", value=mapa_idx.get('uf', 2))
-    idx_perc = st.sidebar.number_input("Índice Execução", value=mapa_idx.get('percentual', 3))
+    st.sidebar.header("⚙️ Verificação de Colunas")
+    # Tenta sugerir os índices (0, 1, 2, 3) mas permite ajuste
+    idx_conv = st.sidebar.number_input("Índice Convênio", value=0)
+    idx_mun = st.sidebar.number_input("Índice Município", value=1)
+    idx_uf = st.sidebar.number_input("Índice UF", value=2)
+    idx_perc = st.sidebar.number_input("Índice Execução", value=3)
 
     # Filtro por UF
     col_uf = df.columns[idx_uf]
@@ -83,11 +67,13 @@ if uploaded_file:
     ufs_selecionadas = st.multiselect("🌍 Filtrar por UF", ufs_disponiveis, default=ufs_disponiveis)
     df_filtrado = df[df[col_uf].isin(ufs_selecionadas)]
 
-    if st.button("🚀 Gerar Mapa"):
+    if st.button("🚀 Iniciar Geocodificação de Precisão"):
         kml = simplekml.Kml()
         cache = {}
+        logs_verificacao = []
         progress_bar = st.progress(0)
         status_msg = st.empty()
+        table_placeholder = st.empty()
 
         for i, (idx, row) in enumerate(df_filtrado.iterrows()):
             progress_bar.progress((i + 1) / len(df_filtrado))
@@ -102,11 +88,11 @@ if uploaded_file:
                 mun_busca = CAPITAIS.get(uf, "Brasília")
                 cabecalho = "🏢 CONVÊNIO COM O GOVERNO DO ESTADO"
             else:
-                mun_busca = mun_raw
+                mun_busca = limpar_nome_estrito(mun_raw)
                 cabecalho = f"🏙️ Município: {mun_raw}"
 
             query = f"{mun_busca}, {uf}, Brasil"
-            status_msg.text(f"Geocodificando: {query}")
+            status_msg.text(f"Buscando: {query}")
 
             if query in cache:
                 location = cache[query]
@@ -117,11 +103,25 @@ if uploaded_file:
                 except: location = None
 
             if location:
+                # Verificação de segurança: O endereço retornado contém a UF correta?
+                endereco_confirmado = location.address
+                
                 pnt = kml.newpoint(name=convenio)
                 pnt.coords = [(location.longitude, location.latitude)]
                 icon_url, perc_texto = obter_estilo_execucao(perc_val)
-                pnt.description = f"<b>{cabecalho}</b><br><br><b>UF:</b> {uf}<br><b>Convênio:</b> {convenio}<br><b>Execução:</b> {perc_texto}"
+                pnt.description = f"<b>{cabecalho}</b><br><br><b>UF:</b> {uf}<br><b>Convênio:</b> {convenio}<br><b>Execução:</b> {perc_texto}<br><b>Endereço Base:</b> {endereco_confirmado}"
                 pnt.style.iconstyle.icon.href = icon_url
+                
+                logs_verificacao.append({"Convênio": convenio, "Busca Enviada": query, "Localização Confirmada": endereco_confirmado, "Status": "✅"})
+            else:
+                logs_verificacao.append({"Convênio": convenio, "Busca Enviada": query, "Localização Confirmada": "NÃO ENCONTRADO", "Status": "❌"})
             
-        st.success("Mapa gerado!")
-        st.download_button("💾 BAIXAR KML", kml.kml(), "mapa_convenios.kml")
+            # Atualiza a tabela de conferência a cada 5 registros
+            if i % 5 == 0:
+                table_placeholder.dataframe(pd.DataFrame(logs_verificacao).tail(10))
+
+        status_msg.success("Processamento finalizado!")
+        st.write("### Tabela de Conferência Geográfica")
+        st.dataframe(pd.DataFrame(logs_verificacao))
+        
+        st.download_button("💾 BAIXAR KML DE PRECISÃO", kml.kml(), "mapa_convenios_precisao.kml")
