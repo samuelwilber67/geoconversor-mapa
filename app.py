@@ -4,79 +4,99 @@ import simplekml
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 import time
+import re
 
 # Configuração da interface
-st.set_page_config(page_title="Geoconversor MAPA v2", layout="wide")
-st.title("📍 Localizador de Convênios MAPA")
+st.set_page_config(page_title="MAPA - Geoprocessamento Pro", layout="wide")
+st.title("📍 Sistema de Geocodificação de Convênios (Escala 1000+)")
 st.markdown("---")
 
-# Inicializa o buscador com um identificador único para evitar bloqueios
-geolocator = Nominatim(user_agent="mapa_geocoder_samuel_v2_2025")
-# RateLimiter garante que não faremos mais de 1 busca por segundo (regra do serviço gratuito)
-geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.2, return_value_on_exception=None)
+def limpar_nome_municipio(nome):
+    """Remove termos burocráticos que atrapalham a busca geográfica"""
+    nome = str(nome).upper()
+    termos = ["MUNICIPIO DE ", "PREFEITURA DE ", "PREFEITURA MUNICIPAL DE ", "GOVERNO DE "]
+    for termo in termos:
+        nome = nome.replace(termo, "")
+    return nome.strip()
 
-uploaded_file = st.file_uploader("Suba sua planilha Excel com Município, UF e Convênio", type=['xlsx', 'xls'])
+# Inicializa o buscador com timeout estendido
+geolocator = Nominatim(user_agent="mapa_infra_v3_2025", timeout=10)
+geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.5, max_retries=3, error_wait_seconds=2)
+
+uploaded_file = st.file_uploader("Suba sua planilha Excel (Suporta até 1000+ linhas)", type=['xlsx', 'xls'])
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
     cols = df.columns.tolist()
     
-    st.info(f"Planilha carregada com {len(df)} linhas.")
-    
-    # Seleção de colunas
-    c1, c2, c3 = st.columns(3)
-    with c1: col_conv = st.selectbox("Coluna Nº Convênio", cols)
-    with c2: col_mun = st.selectbox("Coluna Município", cols)
-    with c3: col_uf = st.selectbox("Coluna UF", cols)
+    st.sidebar.header("Configurações de Colunas")
+    col_conv = st.sidebar.selectbox("Coluna Nº Convênio", cols)
+    col_mun = st.sidebar.selectbox("Coluna Município", cols)
+    col_uf = st.sidebar.selectbox("Coluna UF", cols)
 
-    if st.button("🚀 Iniciar Processamento Geográfico"):
+    st.warning(f"Atenção: Processar {len(df)} linhas levará aproximadamente {round(len(df)*1.6/60)} minutos devido aos limites da API gratuita.")
+
+    if st.button("🚀 Iniciar Processamento em Lote"):
         kml = simplekml.Kml()
-        resultados_debug = []
-        pontos_adicionados = 0
+        cache_coordenadas = {}
+        logs = []
+        pontos_ok = 0
         
         progress_bar = st.progress(0)
         status_msg = st.empty()
 
         for i, row in df.iterrows():
-            # Atualiza progresso
             progress_bar.progress((i + 1) / len(df))
             
-            # Limpa e formata os dados
-            municipio = str(row[col_mun]).strip()
+            # Limpeza e preparação
+            mun_original = str(row[col_mun])
+            mun_limpo = limpar_nome_municipio(mun_original)
             uf = str(row[col_uf]).strip()
             convenio = str(row[col_conv]).strip()
             
-            # Monta a query de busca
-            query = f"{municipio}, {uf}, Brasil"
+            query = f"{mun_limpo}, {uf}, Brasil"
             status_msg.text(f"Processando {i+1}/{len(df)}: {query}")
 
-            try:
-                location = geolocator.geocode(query)
-                if location:
-                    # Adiciona o ponto ao KML
-                    pnt = kml.newpoint(name=convenio)
-                    pnt.coords = [(location.longitude, location.latitude)]
-                    pnt.description = f"Município: {municipio}-{uf}\nConvênio: {convenio}"
-                    
-                    resultados_debug.append({"Convênio": convenio, "Busca": query, "Status": "✅ Encontrado", "Lat/Long": f"{location.latitude}, {location.longitude}"})
-                    pontos_adicionados += 1
-                else:
-                    resultados_debug.append({"Convênio": convenio, "Busca": query, "Status": "❌ Não Localizado", "Lat/Long": "-"})
-            except Exception as e:
-                resultados_debug.append({"Convênio": convenio, "Busca": query, "Status": f"⚠️ Erro: {str(e)}", "Lat/Long": "-"})
-                time.sleep(2) # Pausa maior se houver erro de conexão
+            # Verifica se já buscamos esse município para ganhar tempo
+            if query in cache_coordenadas:
+                location = cache_coordenadas[query]
+            else:
+                try:
+                    location = geolocator.geocode(query)
+                    cache_coordenadas[query] = location
+                except Exception as e:
+                    location = None
+                    logs.append({"Linha": i+2, "Convênio": convenio, "Busca": query, "Erro": "Timeout/Conexão"})
 
-        # Exibe tabela de resultados para conferência
-        st.write("### Relatório de Processamento")
-        st.table(pd.DataFrame(resultados_debug))
+            if location:
+                pnt = kml.newpoint(name=convenio)
+                pnt.coords = [(location.longitude, location.latitude)]
+                pnt.description = f"Município: {mun_original}\nUF: {uf}\nConvênio: {convenio}"
+                pontos_ok += 1
+            else:
+                logs.append({"Linha": i+2, "Convênio": convenio, "Busca": query, "Erro": "Não encontrado"})
 
-        if pontos_adicionados > 0:
-            st.success(f"Sucesso! {pontos_adicionados} pontos foram inseridos no arquivo KML.")
-            st.download_button(
-                label="💾 Baixar Arquivo KML Final",
-                data=kml.kml(),
-                file_name="mapa_convenios_mapa.kml",
-                mime="application/vnd.google-earth.kml+xml"
-            )
-        else:
-            st.error("Nenhum ponto foi encontrado. Verifique se os nomes dos municípios e UFs estão corretos na planilha.")
+        # Finalização
+        status_msg.success(f"Processamento concluído! {pontos_ok} pontos gerados.")
+        
+        col_dl1, col_dl2 = st.columns(2)
+        
+        with col_dl1:
+            if pontos_ok > 0:
+                st.download_button(
+                    label="💾 Baixar KML (Google Earth)",
+                    data=kml.kml(),
+                    file_name="convenios_mapa.kml",
+                    mime="application/vnd.google-earth.kml+xml"
+                )
+        
+        with col_dl2:
+            if logs:
+                df_logs = pd.DataFrame(logs)
+                st.download_button(
+                    label="⚠️ Baixar Relatório de Erros (CSV)",
+                    data=df_logs.to_csv(index=False).encode('utf-8'),
+                    file_name="erros_geolocalizacao.csv",
+                    mime="text/csv"
+                )
+                st.error(f"{len(logs)} linhas apresentaram problemas. Verifique o relatório.")
